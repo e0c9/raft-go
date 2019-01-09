@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"math/rand"
 	"raft-go/labrpc"
 	"sync"
@@ -40,14 +42,14 @@ type Raft struct {
 	// Raft server must maintain
 	// Persistent state on all servers
 	currentTerm int
-	voteFor     int
+	votedFor    int
 	logs        []Log
 
 	// volatile state on all servers
 	commitIndex int
 	lastApplied int
 
-	// volatile state on leaders
+	// volatile state on leaders , Reinitialized after electio
 	nextIndex  []int
 	matchIndex []int
 
@@ -76,25 +78,35 @@ func (rf *Raft) getLastLogTerm() int {
 	return rf.logs[len(rf.logs)-1].Term
 }
 
+//
+// save Raft's persistent state to stable storage,
+// where it can later be retrieved after a crash and restart.
+// see paper's Figure 2 for a description of what should be persistent.
+//
 func (rf *Raft) persist() {
-	// Example
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	e.Encode(rf.commitIndex)
+	e.Encode(rf.lastApplied)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 func (rf *Raft) readPersist(data []byte) {
-	// example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
 	if data == nil || len(data) < 1 {
 		return
 	}
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.logs)
+	d.Decode(&rf.commitIndex)
+	d.Decode(&rf.lastApplied)
+
 }
 
 type RequestVoteArgs struct {
@@ -148,7 +160,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.status = Follower
-		rf.voteFor = -1
+		rf.votedFor = -1
 	}
 
 	reply.VoteGranted = false
@@ -158,12 +170,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		If votedFor is null or candidateId, and candidate’s log is at
 		least as up-to-date as receiver’s log, grant vote
 	*/
-	if (rf.voteFor == -1 || rf.voteFor == args.CandidateId) &&
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		rf.isUpToDate(args.LastLogIndex, args.LastLogTerm) {
 		rf.granted <- true
 		reply.VoteGranted = true
-		rf.voteFor = args.CandidateId
+		rf.votedFor = args.CandidateId
 	}
+
+	rf.persist()
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -180,7 +194,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	if reply.Term > rf.currentTerm {
 		rf.currentTerm = reply.Term
 		rf.status = Follower
-		rf.voteFor = -1
+		rf.votedFor = -1
+		rf.persist()
 		return ok
 	}
 
@@ -232,7 +247,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.status = Follower
-		rf.voteFor = -1
+		rf.votedFor = -1
 	}
 
 	rf.heartbeat <- true
@@ -269,6 +284,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		go rf.applyLogs()
 	}
 
+	rf.persist()
 	reply.Success = true
 
 	return
@@ -297,7 +313,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if reply.Term > rf.currentTerm {
 		rf.currentTerm = reply.Term
 		rf.status = Follower
-		rf.voteFor = -1
+		rf.votedFor = -1
+		rf.persist()
 		return ok
 	}
 
@@ -323,6 +340,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 		if count > len(rf.peers)/2 {
 			rf.commitIndex = N
+			rf.persist()
 			go rf.applyLogs()
 			break
 		}
@@ -365,6 +383,7 @@ func (rf *Raft) applyLogs() {
 		rf.applyCh <- ApplyMsg{Command: rf.logs[i].Command, Index: i}
 	}
 	rf.lastApplied = rf.commitIndex
+	rf.persist()
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -377,6 +396,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		// command received from client: append entry to local log
 		rf.logs = append(rf.logs, Log{Command: command, Term: term})
+		rf.persist()
 		index = rf.getLastLogIndex()
 	}
 
@@ -418,8 +438,9 @@ func (rf *Raft) runServer() {
 			*/
 			rf.mu.Lock()
 			rf.currentTerm++
-			rf.voteFor = rf.me
+			rf.votedFor = rf.me
 			rf.numOfVotes = 1
+			rf.persist()
 			rf.mu.Unlock()
 			rf.sendAllRequestVotes()
 
@@ -456,7 +477,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	rf.voteFor = -1
+	rf.votedFor = -1
 	rf.numOfVotes = 0
 	rf.status = Follower
 	rf.applyCh = applyCh
@@ -467,6 +488,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.winElection = make(chan bool)
 
 	rf.readPersist(persister.ReadRaftState())
+	rf.persist()
 
 	go rf.runServer()
 
