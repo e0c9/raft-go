@@ -311,7 +311,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	//  N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
 	for N := rf.getLastLogIndex(); N > rf.commitIndex; N-- {
-		count := 0
+		count := 1 // except the leader
 
 		if rf.logs[N].Term == rf.currentTerm {
 			for i := range rf.matchIndex {
