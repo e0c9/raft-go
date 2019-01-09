@@ -89,8 +89,6 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logs)
-	e.Encode(rf.commitIndex)
-	e.Encode(rf.lastApplied)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -104,8 +102,6 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.currentTerm)
 	d.Decode(&rf.votedFor)
 	d.Decode(&rf.logs)
-	d.Decode(&rf.commitIndex)
-	d.Decode(&rf.lastApplied)
 
 }
 
@@ -131,8 +127,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term      int
+	Success   bool
+	NextIndex int
 }
 
 func (rf *Raft) isUpToDate(cIndex int, cTerm int) bool {
@@ -237,9 +234,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//DPrintf("Peer[%v](Term [%v]) receives (Leader %v)'s heartbeat", rf.me, rf.currentTerm, args.LeaderId)
 
 	// Reply false if term < currentTerm
+	reply.Success = false
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-		reply.Success = false
 		return
 	}
 
@@ -248,6 +245,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.status = Follower
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	rf.heartbeat <- true
@@ -257,9 +255,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	. follower does not find an entry in its log with the same index and term, refuses
 	. the new entries.
 	*/
-	if args.PrevLogIndex > rf.getLastLogIndex() ||
-		rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Success = false
+
+	// optimize to reduce the number of rejected AppendEntries RPCs
+	if args.PrevLogIndex > rf.getLastLogIndex() {
+		reply.NextIndex = rf.getLastLogIndex() + 1
+		return
+	}
+
+	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		term := rf.logs[args.PrevLogIndex].Term
+		idx := args.PrevLogIndex
+
+		for ; rf.logs[idx].Term == term; idx-- {
+		}
+		reply.NextIndex = idx + 1
 		return
 	}
 
@@ -270,7 +279,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		rf.logs = append(rf.logs, restLogs...)
 	}
-
+	rf.persist()
 	/* leaderCommit > commitIndex, set commitIndex =
 	min(leaderCommit, index of last new entry)
 	*/
@@ -284,7 +293,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		go rf.applyLogs()
 	}
 
-	rf.persist()
 	reply.Success = true
 
 	return
@@ -323,7 +331,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 	} else {
-		rf.nextIndex[server] = args.PrevLogIndex
+		rf.nextIndex[server] = reply.NextIndex
 	}
 
 	//  N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
@@ -340,7 +348,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 		if count > len(rf.peers)/2 {
 			rf.commitIndex = N
-			rf.persist()
 			go rf.applyLogs()
 			break
 		}
@@ -383,7 +390,6 @@ func (rf *Raft) applyLogs() {
 		rf.applyCh <- ApplyMsg{Command: rf.logs[i].Command, Index: i}
 	}
 	rf.lastApplied = rf.commitIndex
-	rf.persist()
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
