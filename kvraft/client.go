@@ -30,16 +30,18 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 // send RPC; ok := ck.server[i].Call("RaftKV.Get",&args, &reply)
 func (ck *Clerk) Get(key string) string {
-	DPrintf("send a Get request: key(%v)", key)
+	DPrintf("DEBUG: send a Get request: key(%v)", key)
 	args := &GetArgs{}
 	args.Key = key
-	reply := &GetReply{}
+	args.Uuid = nrand()
 
 	idx := ck.leaderIndex
 	for {
 		if idx == len(ck.servers) {
 			idx = 0
 		}
+		DPrintf("✉️ Send a Get request to server[%v]: idx[%v] key(%v)", idx, args.Uuid, key)
+		reply := &GetReply{}
 		ok := ck.servers[idx].Call("RaftKV.Get", args, reply)
 		if ok && !reply.WrongLeader {
 			if reply.Err == ErrNoKey {
@@ -53,19 +55,21 @@ func (ck *Clerk) Get(key string) string {
 
 // shared by Put and Append
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	DPrintf("send a Put request: key(%v)->value(%v)", key, value)
 	args := &PutAppendArgs{}
 	args.Key = key
 	args.Value = value
 	args.Op = op
-	reply := &PutAppendReply{}
-
+	args.Uuid = nrand()
 	idx := ck.leaderIndex
 	for {
 		if idx == len(ck.servers) {
 			idx = 0
 		}
+		DPrintf("✉️ send a Put request to server[%v]: idx[%v] key(%v)->value(%v)", idx, args.Uuid, key, value)
+
+		reply := &PutAppendReply{}
 		ok := ck.servers[idx].Call("RaftKV.PutAppend", args, reply)
+		DPrintf("ok[%v] wrongLeader[%v]", ok, reply.WrongLeader)
 		if ok && !reply.WrongLeader {
 			return
 		}

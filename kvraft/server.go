@@ -23,7 +23,7 @@ type Op struct {
 	Type  string
 	Key   string
 	Value string
-	Index int
+	Uuid  int64
 }
 
 type RaftKV struct {
@@ -36,7 +36,7 @@ type RaftKV struct {
 
 	// definitions here
 	store    map[string]string
-	response map[int]chan Result
+	response map[int64]chan Result
 }
 
 type Result struct {
@@ -45,21 +45,23 @@ type Result struct {
 }
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
-	DPrintf("server receve a Get request")
+	DPrintf("📨 server receve a Get request key[%v]", args.Key)
 	op := Op{}
 	op.Key = args.Key
 	op.Type = "Get"
-	index, _, isLeader := kv.rf.Start(op)
+	op.Uuid = args.Uuid
+	reply.WrongLeader = false
+	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader = true
 		return
 	}
-	reply.WrongLeader = false
 	kv.mu.Lock()
-	kv.response[index] = make(chan Result, 1)
+	kv.response[op.Uuid] = make(chan Result, 1)
 	kv.mu.Unlock()
+
 	select {
-	case res := <-kv.response[index]:
+	case res := <-kv.response[op.Uuid]:
 		reply.Err = res.err
 		reply.Value = res.value
 	case <-time.After(1 * time.Second):
@@ -68,43 +70,39 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	DPrintf("server receive PutAppend request")
+	DPrintf("📨 server receive PutAppend request")
 	op := Op{}
 	op.Key = args.Key
 	op.Value = args.Value
 	op.Type = args.Op
-	index, _, isLeader := kv.rf.Start(op)
+	op.Uuid = args.Uuid
+	reply.WrongLeader = false
+
+	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader = true
 		return
 	}
-	DPrintf("BOOM BOOM BOOM, this server is a Leader.")
-	reply.WrongLeader = false
-	kv.response[index] = make(chan Result)
-	DPrintf("index 值为 %v", index)
+	kv.response[op.Uuid] = make(chan Result)
 	select {
-	case res := <-kv.response[index]:
-		DPrintf("收到结果了 为什么出问题")
+	case res := <-kv.response[op.Uuid]:
 		reply.Err = res.err
-	case <-time.After(10 * time.Second):
-		DPrintf("=======================================")
+	case <-time.After(2 * time.Second):
 		reply.WrongLeader = true
 	}
 }
 
 func (kv *RaftKV) Kill() {
 	kv.rf.Kill()
-	// code here
 }
 
 func (kv *RaftKV) runServer() {
-	DPrintf("start run kv server....")
 	for {
 		msg := <-kv.applyCh
-		DPrintf("收到 信息， 可以进行操作了")
 		op, _ := msg.Command.(Op)
 		res := Result{}
 
+		kv.mu.Lock()
 		switch op.Type {
 		case "Get":
 			v, ok := kv.store[op.Key]
@@ -124,8 +122,13 @@ func (kv *RaftKV) runServer() {
 				kv.store[op.Key] = op.Value
 			}
 		}
-		DPrintf("操作结束了， debug de 的我想哭")
-		kv.response[op.Index] <- res
+		DPrintf("🔚 [%v] operation finished: res.value[%v] res.err[%v]", op.Type, res.value, res.err)
+		ch, ok := kv.response[op.Uuid]
+
+		if ok {
+			ch <- res
+		}
+		kv.mu.Unlock()
 
 	}
 }
@@ -140,7 +143,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// initialization code here
 	kv.store = make(map[string]string)
-	kv.response = make(map[int]chan Result)
+	kv.response = make(map[int64]chan Result)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
