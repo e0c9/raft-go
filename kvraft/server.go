@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -23,7 +23,8 @@ type Op struct {
 	Type  string
 	Key   string
 	Value string
-	Uuid  int64
+	Seq   int
+	Cid   int64
 }
 
 type RaftKV struct {
@@ -35,13 +36,27 @@ type RaftKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// definitions here
-	store    map[string]string
-	response map[int64]chan Result
+	store   map[string]string
+	request map[int64]int
+	result  map[int]chan Op
 }
 
-type Result struct {
-	value string
-	err   Err
+func (kv *RaftKV) appendLog(op Op) bool {
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return false
+	}
+	kv.mu.Lock()
+	kv.result[index] = make(chan Op, 1)
+	kv.mu.Unlock()
+
+	select {
+	case cmd := <-kv.result[index]:
+		return cmd == op
+	case <-time.After(800 * time.Millisecond):
+		return false
+	}
+
 }
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
@@ -49,23 +64,23 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	op := Op{}
 	op.Key = args.Key
 	op.Type = "Get"
-	op.Uuid = args.Uuid
+
+	ok := kv.appendLog(op)
 	reply.WrongLeader = false
-	_, _, isLeader := kv.rf.Start(op)
-	if !isLeader {
+	if !ok {
 		reply.WrongLeader = true
 		return
 	}
+
 	kv.mu.Lock()
-	kv.response[op.Uuid] = make(chan Result, 1)
+	value, exist := kv.store[op.Key]
 	kv.mu.Unlock()
 
-	select {
-	case res := <-kv.response[op.Uuid]:
-		reply.Err = res.err
-		reply.Value = res.value
-	case <-time.After(1 * time.Second):
-		reply.WrongLeader = true
+	if exist {
+		reply.Value = value
+		reply.Err = OK
+	} else {
+		reply.Err = ErrNoKey
 	}
 }
 
@@ -75,21 +90,18 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	op.Key = args.Key
 	op.Value = args.Value
 	op.Type = args.Op
-	op.Uuid = args.Uuid
-	reply.WrongLeader = false
+	op.Cid = args.Cid
+	op.Seq = args.Seq
 
-	_, _, isLeader := kv.rf.Start(op)
-	if !isLeader {
+	ok := kv.appendLog(op)
+	reply.WrongLeader = false
+	if !ok {
 		reply.WrongLeader = true
 		return
 	}
-	kv.response[op.Uuid] = make(chan Result)
-	select {
-	case res := <-kv.response[op.Uuid]:
-		reply.Err = res.err
-	case <-time.After(2 * time.Second):
-		reply.WrongLeader = true
-	}
+
+	reply.Err = OK
+
 }
 
 func (kv *RaftKV) Kill() {
@@ -100,36 +112,36 @@ func (kv *RaftKV) runServer() {
 	for {
 		msg := <-kv.applyCh
 		op, _ := msg.Command.(Op)
-		res := Result{}
 
 		kv.mu.Lock()
-		switch op.Type {
-		case "Get":
-			v, ok := kv.store[op.Key]
-			if ok {
-				res.value = v
-				res.err = OK
-			} else {
-				res.err = ErrNoKey
-			}
-		case "Put":
-			kv.store[op.Key] = op.Value
-		case "Append":
-			v, ok := kv.store[op.Key]
-			if ok {
-				kv.store[op.Key] = v + op.Value
-			} else {
-				kv.store[op.Key] = op.Value
+		if op.Type != "Get" {
+			if seq, ok := kv.request[op.Cid]; !ok || op.Seq > seq {
+				kv.execute(op)
+				kv.request[op.Cid] = op.Seq
 			}
 		}
-		DPrintf("🔚 [%v] operation finished: res.value[%v] res.err[%v]", op.Type, res.value, res.err)
-		ch, ok := kv.response[op.Uuid]
+
+		ch, ok := kv.result[msg.Index]
 
 		if ok {
-			ch <- res
+			ch <- op
 		}
 		kv.mu.Unlock()
 
+	}
+}
+
+func (kv *RaftKV) execute(op Op) {
+	switch op.Type {
+	case "Put":
+		kv.store[op.Key] = op.Value
+	case "Append":
+		v, ok := kv.store[op.Key]
+		if ok {
+			kv.store[op.Key] = v + op.Value
+		} else {
+			kv.store[op.Key] = op.Value
+		}
 	}
 }
 
@@ -143,7 +155,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// initialization code here
 	kv.store = make(map[string]string)
-	kv.response = make(map[int64]chan Result)
+	kv.request = make(map[int64]int)
+	kv.result = make(map[int]chan Op)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)

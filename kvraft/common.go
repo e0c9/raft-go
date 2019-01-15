@@ -12,7 +12,8 @@ type PutAppendArgs struct {
 	Value string
 	Op    string // "Put" or "Append"
 	// add definitions here
-	Uuid int64
+	Seq int
+	Cid int64
 }
 
 type PutAppendReply struct {
@@ -22,8 +23,6 @@ type PutAppendReply struct {
 
 type GetArgs struct {
 	Key string
-	// add definitions here
-	Uuid int64
 }
 
 type GetReply struct {

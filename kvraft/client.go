@@ -9,7 +9,9 @@ import (
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// modify this struct
-	leaderIndex int
+	leader int
+	cid    int64
+	seq    int
 }
 
 func nrand() int64 {
@@ -22,7 +24,9 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	ck.leaderIndex = 0
+	ck.leader = 0
+	ck.cid = nrand()
+	ck.seq = 0
 	return ck
 }
 
@@ -33,14 +37,13 @@ func (ck *Clerk) Get(key string) string {
 	DPrintf("DEBUG: send a Get request: key(%v)", key)
 	args := &GetArgs{}
 	args.Key = key
-	args.Uuid = nrand()
 
-	idx := ck.leaderIndex
+	idx := ck.leader
 	for {
 		if idx == len(ck.servers) {
 			idx = 0
 		}
-		DPrintf("✉️ Send a Get request to server[%v]: idx[%v] key(%v)", idx, args.Uuid, key)
+		DPrintf("✉️ Send a Get request to server[%v]:key(%v)", idx, key)
 		reply := &GetReply{}
 		ok := ck.servers[idx].Call("RaftKV.Get", args, reply)
 		if ok && !reply.WrongLeader {
@@ -55,17 +58,19 @@ func (ck *Clerk) Get(key string) string {
 
 // shared by Put and Append
 func (ck *Clerk) PutAppend(key string, value string, op string) {
+	ck.seq++
 	args := &PutAppendArgs{}
 	args.Key = key
 	args.Value = value
+	args.Seq = ck.seq
+	args.Cid = ck.cid
 	args.Op = op
-	args.Uuid = nrand()
-	idx := ck.leaderIndex
+	idx := ck.leader
 	for {
 		if idx == len(ck.servers) {
 			idx = 0
 		}
-		DPrintf("✉️ send a Put request to server[%v]: idx[%v] key(%v)->value(%v)", idx, args.Uuid, key, value)
+		DPrintf("✉️ send a Put request to server[%v]: cid[%v]idx[%v] key(%v)->value(%v)", idx, args.Cid, args.Seq, key, value)
 
 		reply := &PutAppendReply{}
 		ok := ck.servers[idx].Call("RaftKV.PutAppend", args, reply)
