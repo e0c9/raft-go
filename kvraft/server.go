@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"encoding/gob"
 	"log"
 	"raft-go/labrpc"
@@ -47,13 +48,14 @@ func (kv *RaftKV) appendLog(op Op) bool {
 		return false
 	}
 	kv.mu.Lock()
+	// note：can not use `make(chan op)`
 	kv.result[index] = make(chan Op, 1)
 	kv.mu.Unlock()
 
 	select {
 	case cmd := <-kv.result[index]:
 		return cmd == op
-	case <-time.After(800 * time.Millisecond):
+	case <-time.After(200 * time.Millisecond):
 		return false
 	}
 
@@ -111,6 +113,21 @@ func (kv *RaftKV) Kill() {
 func (kv *RaftKV) runServer() {
 	for {
 		msg := <-kv.applyCh
+		if msg.UseSnapshot {
+			data := msg.Snapshot
+			var lastIncludedIndex int
+			var lastIncludedTerm int
+			r := bytes.NewBuffer(data)
+			d := gob.NewDecoder(r)
+			kv.mu.Lock()
+			d.Decode(&lastIncludedIndex)
+			d.Decode(&lastIncludedTerm)
+			kv.store = make(map[string]string)
+			kv.request = make(map[int64]int)
+			d.Decode(&kv.store)
+			d.Decode(&kv.request)
+			kv.mu.Unlock()
+		}
 		op, _ := msg.Command.(Op)
 
 		kv.mu.Lock()
@@ -125,6 +142,13 @@ func (kv *RaftKV) runServer() {
 
 		if ok {
 			ch <- op
+		}
+		if kv.maxraftstate != -1 && kv.rf.RaftStateSize() > kv.maxraftstate {
+			buf := new(bytes.Buffer)
+			e := gob.NewEncoder(buf)
+			e.Encode(&kv.store)
+			e.Encode(&kv.request)
+			go kv.rf.StartSnapshot(buf.Bytes(), msg.Index)
 		}
 		kv.mu.Unlock()
 
