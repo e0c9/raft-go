@@ -13,7 +13,7 @@ type Clerk struct {
 	leader int
 	cid    int64
 	seq    int
-	mu sync.Mutex
+	mu     sync.Mutex
 }
 
 func nrand() int64 {
