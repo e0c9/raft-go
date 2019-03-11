@@ -45,7 +45,6 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 	logs        []Log
-	logOffset   int // logs has been compacted before this index
 
 	// volatile state on all servers
 	commitIndex int
@@ -106,6 +105,28 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.votedFor)
 	d.Decode(&rf.logs)
 
+}
+
+func (rf *Raft) readSnapshot(data []byte) {
+	if data == nil || len(data) == 0 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+	d.Decode(&lastIncludedIndex)
+	d.Decode(&lastIncludedTerm)
+
+	rf.commitIndex = lastIncludedIndex
+	rf.lastApplied = lastIncludedIndex
+
+	rf.logs = rf.truncateLog(lastIncludedIndex, lastIncludedTerm)
+	msg := ApplyMsg{UseSnapshot: true, Snapshot: data}
+	go func() {
+		rf.applyCh <- msg
+	}()
 }
 
 type RequestVoteArgs struct {
@@ -325,23 +346,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	base := rf.logs[0].Index
-	if rf.logs[args.PrevLogIndex - base].Term != args.PrevLogTerm {
-		term := rf.logs[args.PrevLogIndex - base].Term
-		idx := args.PrevLogIndex
+	//fmt.Println(strconv.Itoa(base) + " " + strconv.Itoa(args.PrevLogIndex))
+	if base < args.PrevLogIndex {
+		if rf.logs[args.PrevLogIndex-base].Term != args.PrevLogTerm {
+			term := rf.logs[args.PrevLogIndex-base].Term
+			idx := args.PrevLogIndex
 
-		for ; rf.logs[idx - base].Term == term; idx-- {
+			for ; idx >= base && rf.logs[idx-base].Term == term; idx-- {
+			}
+			reply.NextIndex = idx + 1
+			return
 		}
-		reply.NextIndex = idx + 1
-		return
+	}
+	if base <= args.PrevLogIndex {
+		restLogs := rf.logs[args.PrevLogIndex+1-base:]
+		rf.logs = rf.logs[:args.PrevLogIndex+1-base]
+		if rf.hasConflict(restLogs, args.Entries) {
+			rf.logs = append(rf.logs, args.Entries...)
+		} else {
+			rf.logs = append(rf.logs, restLogs...)
+		}
 	}
 
-	restLogs := rf.logs[args.PrevLogIndex+1-base:]
-	rf.logs = rf.logs[:args.PrevLogIndex+1-base]
-	if rf.hasConflict(restLogs, args.Entries) {
-		rf.logs = append(rf.logs, args.Entries...)
-	} else {
-		rf.logs = append(rf.logs, restLogs...)
-	}
 	rf.persist()
 	/* leaderCommit > commitIndex, set commitIndex =
 	min(leaderCommit, index of last new entry)
@@ -399,9 +425,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	//  N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
 	base := rf.logs[0].Index
+
 	for N := rf.getLastLogIndex(); N > rf.commitIndex; N-- {
 		count := 1 // except the leader
-
+		//	fmt.Println(strconv.Itoa(N) + " " + strconv.Itoa(base) + " " + strconv.Itoa(rf.commitIndex))
 		if rf.logs[N-base].Term == rf.currentTerm {
 			for i := range rf.matchIndex {
 				if rf.matchIndex[i] >= N {
@@ -569,7 +596,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.winElection = make(chan bool)
 
 	rf.readPersist(persister.ReadRaftState())
-	rf.persist()
+	rf.readSnapshot(persister.ReadSnapshot())
+	//rf.persist()
 
 	go rf.runServer()
 
@@ -591,7 +619,7 @@ func (rf *Raft) StartSnapshot(snapshot []byte, index int) {
 	defer rf.mu.Unlock()
 	baseIndex := rf.logs[0].Index
 	lastIndex := rf.getLastLogIndex()
-	if index <= baseIndex && index > lastIndex {
+	if index <= baseIndex || index > lastIndex {
 		return
 	}
 	var newLogs []Log

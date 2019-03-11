@@ -23,6 +23,9 @@ type PutAppendReply struct {
 
 type GetArgs struct {
 	Key string
+
+	Seq int
+	Cid int64
 }
 
 type GetReply struct {

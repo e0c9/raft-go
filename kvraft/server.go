@@ -76,6 +76,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 
 	kv.mu.Lock()
 	value, exist := kv.store[op.Key]
+	kv.request[args.Cid] = args.Seq
 	kv.mu.Unlock()
 
 	if exist {
@@ -131,11 +132,9 @@ func (kv *RaftKV) runServer() {
 		op, _ := msg.Command.(Op)
 
 		kv.mu.Lock()
-		if op.Type != "Get" {
-			if seq, ok := kv.request[op.Cid]; !ok || op.Seq > seq {
-				kv.execute(op)
-				kv.request[op.Cid] = op.Seq
-			}
+		if seq, ok := kv.request[op.Cid]; !ok || op.Seq > seq {
+			kv.execute(op)
+			kv.request[op.Cid] = op.Seq
 		}
 
 		ch, ok := kv.result[msg.Index]

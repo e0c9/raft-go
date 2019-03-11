@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"math/big"
 	"raft-go/labrpc"
+	"sync"
 )
 
 type Clerk struct {
@@ -12,6 +13,7 @@ type Clerk struct {
 	leader int
 	cid    int64
 	seq    int
+	mu sync.Mutex
 }
 
 func nrand() int64 {
@@ -37,6 +39,11 @@ func (ck *Clerk) Get(key string) string {
 	DPrintf("DEBUG: send a Get request: key(%v)", key)
 	args := &GetArgs{}
 	args.Key = key
+	args.Cid = ck.cid
+	ck.mu.Lock()
+	args.Seq = ck.seq
+	ck.seq++
+	ck.mu.Unlock()
 
 	idx := ck.leader
 	for {
@@ -58,11 +65,13 @@ func (ck *Clerk) Get(key string) string {
 
 // shared by Put and Append
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	ck.seq++
 	args := &PutAppendArgs{}
 	args.Key = key
 	args.Value = value
+	ck.mu.Lock()
 	args.Seq = ck.seq
+	ck.seq++
+	ck.mu.Unlock()
 	args.Cid = ck.cid
 	args.Op = op
 	idx := ck.leader
