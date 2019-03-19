@@ -1,14 +1,19 @@
 package shardmaster
 
 import (
-	"fmt"
 	"raft-go/raft"
-	"strconv"
 	"time"
 )
 import "raft-go/labrpc"
 import "sync"
 import "encoding/gob"
+
+const (
+	JOIN = iota
+	LEAVE
+	MOVE
+	QUERY
+)
 
 type ShardMaster struct {
 	mu      sync.Mutex
@@ -18,17 +23,25 @@ type ShardMaster struct {
 
 	// Your data here.
 	request map[int64]int
-	result  map[int]chan Op
+	result  map[int]chan int
 
 	configs []Config // indexed by config num
 }
 
 type Op struct {
-	// Your data here.
-	Type    string
-	Cid int64
-	Seq int
-	Command interface{}
+	Type  int
+	Index int
+	Cid   int64
+	Seq   int
+	// join
+	Servers map[int][]string
+	// leave
+	GIDs []int
+	// move
+	Shard int
+	GID   int
+	// query
+	Num int
 }
 
 func (sm *ShardMaster) appendLog(op Op) bool {
@@ -37,16 +50,16 @@ func (sm *ShardMaster) appendLog(op Op) bool {
 		return false
 	}
 	sm.mu.Lock()
-	// note：can not use `make(chan op)`
-	sm.result[index] = make(chan Op, 1)
+	// note：can not use `make(chan Op)`
+	sm.result[index] = make(chan int, 1)
 	sm.mu.Unlock()
 
 	select {
-	case cmd := <-sm.result[index]:
+	case idx := <-sm.result[index]:
 		sm.mu.Lock()
 		sm.request[op.Cid] = op.Seq
 		sm.mu.Unlock()
-		return cmd == op
+		return idx == op.Index
 	case <-time.After(200 * time.Millisecond):
 		return false
 	}
@@ -55,10 +68,10 @@ func (sm *ShardMaster) appendLog(op Op) bool {
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
 	op := Op{}
-	op.Type = "JOIN"
+	op.Type = JOIN
 	op.Cid = args.Cid
 	op.Seq = args.Seq
-	op.Command = args
+	op.Servers = args.Servers
 
 	if !sm.appendLog(op) {
 		reply.WrongLeader = true
@@ -71,8 +84,8 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
 	op := Op{}
-	op.Type = "LEAVE"
-	op.Command = args
+	op.Type = LEAVE
+	op.GIDs = args.GIDs
 	op.Cid = args.Cid
 	op.Seq = args.Seq
 
@@ -87,8 +100,9 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
 	op := Op{}
-	op.Type = "MOVE"
-	op.Command = args
+	op.Type = MOVE
+	op.Shard = args.Shard
+	op.GID = args.GID
 	op.Cid = args.Cid
 	op.Seq = args.Seq
 
@@ -103,8 +117,8 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
 	op := Op{}
-	op.Type = "QUERY"
-	op.Command = args
+	op.Type = QUERY
+	op.Num = args.Num
 	op.Cid = args.Cid
 	op.Seq = args.Seq
 
@@ -144,58 +158,42 @@ func (sm *ShardMaster) runServer() {
 	for {
 		msg := <-sm.applyCh
 		op, _ := msg.Command.(Op)
-
-		switch op.Type {
-		case "JOIN":
-			joinArgs := op.Command.(*JoinArgs)
-			fmt.Println("收到Join")
-			sm.mu.Lock()
-			if sm.checkDuplicate(joinArgs.Cid, joinArgs.Seq) {
-				fmt.Println("进入 Join 成功")
+		if !sm.checkDuplicate(op.Cid, op.Seq) {
+			switch op.Type {
+			case JOIN:
+				sm.mu.Lock()
 				config := sm.newConfig()
-				for gid, servers := range joinArgs.Servers {
-					fmt.Println("Join " + strconv.Itoa(gid))
+				for gid, servers := range op.Servers {
+					//fmt.Println("Join " + strconv.Itoa(gid))
 					config.Groups[gid] = servers
 				}
 				sm.updateConfig(config)
 				sm.success(msg.Index, op)
-			}
-			sm.mu.Unlock()
-		case "LEAVE":
-			leaveArgs := op.Command.(*LeaveArgs)
-			fmt.Println("收到 Leave")
-			sm.mu.Lock()
-			if sm.checkDuplicate(leaveArgs.Cid, leaveArgs.Seq) {
-				fmt.Println("leave 成功进入")
+				sm.mu.Unlock()
+			case LEAVE:
+				sm.mu.Lock()
 				config := sm.newConfig()
-				for _, gid := range leaveArgs.GIDs {
-					fmt.Println("Leave " + strconv.Itoa(gid))
+				for _, gid := range op.GIDs {
+					//fmt.Println("Leave " + strconv.Itoa(gid))
 					delete(config.Groups, gid)
 				}
 				sm.updateConfig(config)
 				sm.success(msg.Index, op)
-			}
-			sm.mu.Unlock()
-		case "MOVE":
-			moveArgs := op.Command.(*MoveArgs)
-			sm.mu.Lock()
-			if sm.checkDuplicate(moveArgs.Cid, moveArgs.Seq) {
+				sm.mu.Unlock()
+			case MOVE:
+				sm.mu.Lock()
 				config := sm.newConfig()
-				config.Shards[moveArgs.Shard] = moveArgs.GID
+				config.Shards[op.Shard] = op.GID
 				sm.configs = append(sm.configs, config)
 				sm.success(msg.Index, op)
-			}
-			sm.mu.Unlock()
-		case "QUERY":
-			queryArgs := op.Command.(*QueryArgs)
-			sm.mu.Lock()
-			fmt.Println("Query 请求序号：" + strconv.Itoa(queryArgs.Seq) + " 请求配置编号：" +
-				strconv.Itoa(queryArgs.Num) + " 现有的配置文件： " + strconv.Itoa(len(sm.configs)) + " 现在序号 " + strconv.Itoa(sm.request[queryArgs.Cid]))
-			if sm.checkDuplicate(queryArgs.Cid, queryArgs.Seq) {
+				sm.mu.Unlock()
+			case QUERY:
+				sm.mu.Lock()
+				//fmt.Println("Query 请求序号：" + strconv.Itoa(op.Seq) + " 请求配置编号：" +
+				//	strconv.Itoa(op.Num) + " 现有的配置文件： " + strconv.Itoa(len(sm.configs)) + " 现在序号 " + strconv.Itoa(sm.request[op.Cid]))
 				sm.success(msg.Index, op)
+				sm.mu.Unlock()
 			}
-			sm.mu.Unlock()
-
 		}
 	}
 }
@@ -216,7 +214,7 @@ func (sm *ShardMaster) newConfig() Config {
 func (sm *ShardMaster) success(index int, op Op) {
 	ch, ok := sm.result[index]
 	if ok {
-		ch <- op
+		ch <- op.Index
 	}
 }
 
@@ -265,9 +263,9 @@ func (sm *ShardMaster) updateConfig(config Config) {
 
 func (sm *ShardMaster) checkDuplicate(cid int64, seq int) bool {
 	if lastSeq, ok := sm.request[cid]; ok {
-		return seq > lastSeq
+		return seq <= lastSeq
 	}
-	return true
+	return false
 
 }
 
@@ -286,7 +284,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 
 	gob.Register(Op{})
 	sm.applyCh = make(chan raft.ApplyMsg)
-	sm.result = make(map[int]chan Op)
+	sm.result = make(map[int]chan int)
 	sm.request = make(map[int64]int)
 	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
 
