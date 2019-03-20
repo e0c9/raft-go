@@ -129,7 +129,7 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	}
 
 	sm.mu.Lock()
-	if args.Num == -1 || args.Num >= len(sm.configs) {
+	if args.Num < 0 || args.Num >= len(sm.configs) {
 		reply.Config = sm.configs[len(sm.configs)-1]
 	} else {
 		reply.Config = sm.configs[args.Num]
@@ -164,7 +164,6 @@ func (sm *ShardMaster) runServer() {
 				sm.mu.Lock()
 				config := sm.newConfig()
 				for gid, servers := range op.Servers {
-					//fmt.Println("Join " + strconv.Itoa(gid))
 					config.Groups[gid] = servers
 				}
 				sm.updateConfig(config)
@@ -174,7 +173,6 @@ func (sm *ShardMaster) runServer() {
 				sm.mu.Lock()
 				config := sm.newConfig()
 				for _, gid := range op.GIDs {
-					//fmt.Println("Leave " + strconv.Itoa(gid))
 					delete(config.Groups, gid)
 				}
 				sm.updateConfig(config)
@@ -189,8 +187,6 @@ func (sm *ShardMaster) runServer() {
 				sm.mu.Unlock()
 			case QUERY:
 				sm.mu.Lock()
-				//fmt.Println("Query 请求序号：" + strconv.Itoa(op.Seq) + " 请求配置编号：" +
-				//	strconv.Itoa(op.Num) + " 现有的配置文件： " + strconv.Itoa(len(sm.configs)) + " 现在序号 " + strconv.Itoa(sm.request[op.Cid]))
 				sm.success(msg.Index, op)
 				sm.mu.Unlock()
 			}
@@ -203,10 +199,14 @@ func (sm *ShardMaster) newConfig() Config {
 	newConfig := Config{}
 	newConfig.Num = oldConfig.Num + 1
 	newConfig.Groups = make(map[int][]string)
+	newConfig.Shards = [NShards]int{}
 	for k, v := range oldConfig.Groups {
-		tmp := make([]string, len(v))
-		copy(tmp, v)
-		newConfig.Groups[k] = tmp
+		servers := make([]string, len(v))
+		copy(servers, v)
+		newConfig.Groups[k] = servers
+	}
+	for i, v := range oldConfig.Shards {
+		newConfig.Shards[i] = v
 	}
 	return newConfig
 }
@@ -220,53 +220,70 @@ func (sm *ShardMaster) success(index int, op Op) {
 
 func (sm *ShardMaster) updateConfig(config Config) {
 	var gids []int
-	for gid := range config.Groups {
-		gids = append(gids, gid)
+	for k := range config.Groups {
+		gids = append(gids, k)
 	}
-	g2s := make(map[int][]int)
-	var shards []int
-	for shard, gid := range config.Shards {
-		if _, ok := config.Groups[gid]; !ok {
-			shards = append(shards, shard)
+
+	var neededMove []int
+	g2s := make(map[int][]int) // gid --> shards
+	for sid, gid := range config.Shards {
+		if _, ok := config.Groups[gid]; ok {
+			g2s[gid] = append(g2s[gid], sid)
 		} else {
-			g2s[gid] = append(g2s[gid], shard)
+			neededMove = append(neededMove, sid)
 		}
 	}
-	if len(shards) != 0 {
-		for i, j := 0, 0; i < len(shards); i++ {
-			if j == len(gids) {
-				j = 0
+
+	expected := len(config.Shards) / len(config.Groups)
+
+	for gid, sids := range g2s {
+		if len(sids) > expected {
+			neededMove = append(neededMove, sids[expected:]...)
+			g2s[gid] = sids[:expected]
+		}
+	}
+
+	nIndex := 0
+	for _, gid := range gids {
+		if sids, ok := g2s[gid]; !ok {
+			g2s[gid] = make([]int, expected)
+			end := nIndex + expected
+			for ; nIndex < len(neededMove) && nIndex < end; nIndex++ {
+				config.Shards[neededMove[nIndex]] = gid
+				g2s[gid] = append(g2s[gid], neededMove[nIndex])
 			}
-			config.Shards[shards[i]] = gids[j]
-			j++
-		}
-	} else {
-		expected := len(shards) / len(gids)
-		var moveShards []int
-		var newJoin int
-		for k, v := range g2s {
-			if len(v) > expected {
-				for i := 0; i < len(v)-expected; i++ {
-					moveShards = append(moveShards, v[i])
-				}
-			} else if len(v) == 0 {
-				newJoin = k
+		} else if len(sids) < expected {
+			diff := expected - len(sids)
+			end := nIndex + diff
+			for ; nIndex < len(neededMove) && nIndex < end; nIndex++ {
+				config.Shards[neededMove[nIndex]] = gid
+				g2s[gid] = append(g2s[gid], neededMove[nIndex])
 			}
 		}
-		for shard := range moveShards {
-			config.Shards[shard] = newJoin
+	}
+
+
+
+	gIndex := 0
+	for nIndex < len(neededMove) {
+		if gIndex == len(gids) {
+			gIndex = 0
 		}
+		config.Shards[neededMove[nIndex]] = gids[gIndex]
+		gIndex++
+		nIndex++
 	}
 
 	sm.configs = append(sm.configs, config)
 }
 
 func (sm *ShardMaster) checkDuplicate(cid int64, seq int) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	if lastSeq, ok := sm.request[cid]; ok {
 		return seq <= lastSeq
 	}
 	return false
-
 }
 
 //
