@@ -1,12 +1,12 @@
 package shardmaster
 
 import (
+	"encoding/gob"
+	"raft-go/labrpc"
 	"raft-go/raft"
+	"sync"
 	"time"
 )
-import "raft-go/labrpc"
-import "sync"
-import "encoding/gob"
 
 const (
 	JOIN = iota
@@ -224,7 +224,7 @@ func (sm *ShardMaster) updateConfig(config Config) {
 		gids = append(gids, k)
 	}
 
-	var neededMove []int
+	var neededMove []int       // shards needed to reassign
 	g2s := make(map[int][]int) // gid --> shards
 	for sid, gid := range config.Shards {
 		if _, ok := config.Groups[gid]; ok {
@@ -233,43 +233,47 @@ func (sm *ShardMaster) updateConfig(config Config) {
 			neededMove = append(neededMove, sid)
 		}
 	}
-
-	expected := len(config.Shards) / len(config.Groups)
-
-	for gid, sids := range g2s {
+	expected := len(config.Shards) / len(gids)
+	if expected == 0 {
+		expected = 1
+	}
+	for _, sids := range g2s {
 		if len(sids) > expected {
 			neededMove = append(neededMove, sids[expected:]...)
-			g2s[gid] = sids[:expected]
+		}
+	}
+
+	var candidateGids []int
+	for _, gid := range gids {
+		if _, ok := g2s[gid]; !ok {
+			candidateGids = append(candidateGids, gid)
+		} else if len(g2s[gid]) < expected {
+			candidateGids = append(candidateGids, gid)
 		}
 	}
 
 	nIndex := 0
-	for _, gid := range gids {
+	for _, gid := range candidateGids {
 		if sids, ok := g2s[gid]; !ok {
-			g2s[gid] = make([]int, expected)
 			end := nIndex + expected
 			for ; nIndex < len(neededMove) && nIndex < end; nIndex++ {
 				config.Shards[neededMove[nIndex]] = gid
-				g2s[gid] = append(g2s[gid], neededMove[nIndex])
 			}
 		} else if len(sids) < expected {
 			diff := expected - len(sids)
 			end := nIndex + diff
 			for ; nIndex < len(neededMove) && nIndex < end; nIndex++ {
 				config.Shards[neededMove[nIndex]] = gid
-				g2s[gid] = append(g2s[gid], neededMove[nIndex])
 			}
 		}
 	}
 
-
-
 	gIndex := 0
-	for nIndex < len(neededMove) {
-		if gIndex == len(gids) {
+	for nIndex < len(neededMove) && len(candidateGids) != 0 {
+		if gIndex == len(candidateGids) {
 			gIndex = 0
 		}
-		config.Shards[neededMove[nIndex]] = gids[gIndex]
+		config.Shards[neededMove[nIndex]] = candidateGids[gIndex]
 		gIndex++
 		nIndex++
 	}
