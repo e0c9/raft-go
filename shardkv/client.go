@@ -8,7 +8,10 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "raft-go/labrpc"
+import (
+	"raft-go/labrpc"
+	"sync"
+)
 import "crypto/rand"
 import "math/big"
 import "raft-go/shardmaster"
@@ -40,6 +43,9 @@ type Clerk struct {
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	cid int64
+	seq int
+	mu  sync.Mutex
 }
 
 //
@@ -56,6 +62,8 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.cid = nrand()
+	ck.seq = 1
 	return ck
 }
 
@@ -68,6 +76,11 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
+	args.Cid = ck.cid
+	ck.mu.Lock()
+	args.Seq = ck.seq
+	ck.seq++
+	ck.mu.Unlock()
 
 	for {
 		shard := key2shard(key)
@@ -103,6 +116,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
+	args.Cid = ck.cid
+	ck.mu.Lock()
+	args.Seq = ck.seq
+	ck.seq++
+	ck.mu.Unlock()
 
 	for {
 		shard := key2shard(key)

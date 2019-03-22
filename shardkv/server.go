@@ -1,15 +1,24 @@
 package shardkv
 
 // import "shardmaster"
-import "raft-go/labrpc"
-import "raft-go/raft"
-import "sync"
-import "encoding/gob"
+import (
+	"bytes"
+	"encoding/gob"
+	"raft-go/labrpc"
+	"raft-go/raft"
+	"sync"
+	"time"
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type  string
+	Key   string
+	Value string
+	Cid   int64
+	Seq   int
 }
 
 type ShardKV struct {
@@ -23,14 +32,68 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	store   map[string]string
+	request map[int64]int
+	result  map[int]chan bool
+}
+
+func (kv *ShardKV) appendLog(op Op) bool {
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return false
+	}
+	kv.mu.Lock()
+	kv.result[index] = make(chan bool, 1)
+	kv.mu.Unlock()
+
+	select {
+	case ok := <-kv.result[index]:
+		kv.mu.Lock()
+		kv.request[op.Cid] = op.Seq
+		kv.mu.Unlock()
+		return ok
+	case <-time.After(800 * time.Millisecond):
+		return false
+	}
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	op := Op{}
+	op.Key = args.Key
+	op.Type = "Get"
+	reply.WrongLeader = false
+	if ok := kv.appendLog(op); !ok {
+		reply.WrongLeader = true
+		return
+	}
+
+	kv.mu.Lock()
+	if value, exist := kv.store[op.Key]; exist {
+		reply.Value = value
+		reply.Err = OK
+	} else {
+		reply.Err = ErrNoKey
+	}
+	kv.mu.Unlock()
+
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{}
+	op.Key = args.Key
+	op.Value = args.Value
+	op.Type = args.Op
+	op.Cid = args.Cid
+	op.Seq = args.Seq
+
+	if ok := kv.appendLog(op); !ok {
+		reply.WrongLeader = true
+	} else {
+		reply.WrongLeader = false
+		reply.Err = OK
+	}
 }
 
 //
@@ -42,6 +105,57 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+}
+
+func (kv *ShardKV) runServer() {
+	for {
+		msg := <-kv.applyCh
+		if msg.UseSnapshot {
+			data := msg.Snapshot
+			var lastIncludedIndex int
+			var lastIncludedTerm int
+			r := bytes.NewBuffer(data)
+			d := gob.NewDecoder(r)
+			kv.mu.Lock()
+			d.Decode(&lastIncludedIndex)
+			d.Decode(&lastIncludedTerm)
+			d.Decode(&kv.store)
+			d.Decode(&kv.request)
+			kv.mu.Unlock()
+		}
+		op, _ := msg.Command.(Op)
+		kv.mu.Lock()
+		if seq, ok := kv.request[op.Cid]; !ok || op.Seq > seq {
+			kv.execute(op)
+		}
+
+		ch, ok := kv.result[msg.Index]
+		if ok {
+			ch <- true
+		}
+		if kv.maxraftstate != -1 && kv.rf.RaftStateSize() > kv.maxraftstate {
+			buf := new(bytes.Buffer)
+			e := gob.NewEncoder(buf)
+			e.Encode(&kv.store)
+			e.Encode(&kv.request)
+			go kv.rf.StartSnapshot(buf.Bytes(), msg.Index)
+		}
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *ShardKV) execute(op Op) {
+	switch op.Type {
+	case "Put":
+		kv.store[op.Key] = op.Value
+	case "Append":
+		v, ok := kv.store[op.Key]
+		if ok {
+			kv.store[op.Key] = v + op.Value
+		} else {
+			kv.store[op.Key] = op.Value
+		}
+	}
 }
 
 //
@@ -85,12 +199,17 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.masters = masters
 
 	// Your initialization code here.
+	kv.store = make(map[string]string)
+	kv.request = make(map[int64]int)
+	kv.result = make(map[int]chan bool)
 
 	// Use something like this to talk to the shardmaster:
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	go kv.runServer()
 
 	return kv
 }
