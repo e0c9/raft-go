@@ -15,9 +15,8 @@ type PutAppendArgs struct {
 	Key   string
 	Value string
 	Op    string
-	// You'll have to add definitions here
-	Cid int64
-	Seq int
+	Cid   int64
+	Seq   int
 }
 
 type PutAppendReply struct {
@@ -27,7 +26,6 @@ type PutAppendReply struct {
 
 type GetArgs struct {
 	Key string
-	// You'll have to add definitions here.
 	Cid int64
 	Seq int
 }
@@ -47,13 +45,13 @@ type GetShardReply struct {
 	WrongLeader bool
 	Err         Err
 	Content     map[string]string
-	TaskSeq     map[int64]int
+	Request     map[int64]int
 }
 
 type ReconfigureArgs struct {
 	Cfg     shardmaster.Config
 	Content map[string]string
-	TaskSeq map[int64]int
+	Request map[int64]int
 }
 
 type ReconfigureReply struct {

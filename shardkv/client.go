@@ -9,13 +9,13 @@ package shardkv
 //
 
 import (
+	"crypto/rand"
+	"math/big"
 	"raft-go/labrpc"
+	"raft-go/shardmaster"
 	"sync"
+	"time"
 )
-import "crypto/rand"
-import "math/big"
-import "raft-go/shardmaster"
-import "time"
 
 //
 // which shard is a key in?
@@ -42,7 +42,6 @@ type Clerk struct {
 	sm       *shardmaster.Clerk
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
-	// You will have to modify this struct.
 	cid int64
 	seq int
 	mu  sync.Mutex
@@ -63,7 +62,7 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.make_end = make_end
 	// You'll have to add code here.
 	ck.cid = nrand()
-	ck.seq = 1
+	ck.seq = 0
 	return ck
 }
 
