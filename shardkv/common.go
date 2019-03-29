@@ -44,13 +44,13 @@ type GetShardArgs struct {
 type GetShardReply struct {
 	WrongLeader bool
 	Err         Err
-	Content     map[string]string
+	Content     [shardmaster.NShards]map[string]string
 	Request     map[int64]int
 }
 
 type ReconfigureArgs struct {
 	Cfg     shardmaster.Config
-	Content map[string]string
+	Content [shardmaster.NShards]map[string]string
 	Request map[int64]int
 }
 
