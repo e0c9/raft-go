@@ -15,24 +15,6 @@ const (
 	Leader
 )
 
-//
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make().
-//
-type ApplyMsg struct {
-	Index       int
-	Command     interface{}
-	UseSnapshot bool
-	Snapshot    []byte
-}
-
-type Log struct {
-	Command interface{}
-	Term    int
-	Index   int
-}
-
 // A Go object implementing a single Raft peer
 type Raft struct {
 	mu        sync.Mutex
@@ -68,8 +50,8 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term := rf.currentTerm
-	isleader := rf.status == Leader
-	return term, isleader
+	isLeader := rf.status == Leader
+	return term, isLeader
 }
 
 func (rf *Raft) getLastLogIndex() int {
@@ -107,6 +89,43 @@ func (rf *Raft) readPersist(data []byte) {
 
 }
 
+// 日志快照保存
+type SnapShot struct {
+	Data      []byte
+	LogOffset int
+	Term      int
+}
+
+func (rf *Raft) RaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) StartSnapshot(snapshot []byte, index int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	baseIndex := rf.logs[0].Index
+	lastIndex := rf.getLastLogIndex()
+	if index <= baseIndex || index > lastIndex {
+		return
+	}
+	var newLogs []Log
+	newLogs = append(newLogs, Log{Term: rf.logs[index-baseIndex].Term, Index: index})
+	for i := index + 1; i <= lastIndex; i++ {
+		newLogs = append(newLogs, rf.logs[i-baseIndex])
+	}
+	rf.logs = newLogs
+	rf.persist()
+
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(newLogs[0].Index)
+	e.Encode(newLogs[0].Term)
+
+	data := w.Bytes()
+	data = append(data, snapshot...)
+	rf.persister.SaveSnapshot(data)
+}
+
 func (rf *Raft) readSnapshot(data []byte) {
 	if data == nil || len(data) == 0 {
 		return
@@ -127,44 +146,6 @@ func (rf *Raft) readSnapshot(data []byte) {
 	go func() {
 		rf.applyCh <- msg
 	}()
-}
-
-type RequestVoteArgs struct {
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
-}
-
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []Log
-	LeaderCommit int
-}
-
-type AppendEntriesReply struct {
-	Term      int
-	Success   bool
-	NextIndex int
-}
-
-type InstallSnapshotArgs struct {
-	Term              int
-	LastIncludedIndex int
-	LastIncludedTerm  int
-	Data              []byte
-}
-
-type InstallSnapshotReply struct {
-	Term int
 }
 
 func (rf *Raft) InstallSnapShot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
@@ -224,7 +205,7 @@ func (rf *Raft) isUpToDate(cIndex int, cTerm int) bool {
 	return cIndex >= index
 }
 
-// 2B
+// Leader election, heartbeat, append logs
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -485,11 +466,15 @@ func (rf *Raft) sendAllAppendEntries() {
 }
 
 func (rf *Raft) applyLogs() {
+	//copy_on_write
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	base := rf.logs[0].Index
+	applyLog := make([]Log, len(rf.logs))
+	copy(applyLog, rf.logs)
+	rf.mu.Unlock()
+
+	base := applyLog[0].Index
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		rf.applyCh <- ApplyMsg{Command: rf.logs[i-base].Command, Index: i}
+		rf.applyCh <- ApplyMsg{Command: applyLog[i-base].Command, Index: i}
 	}
 	rf.lastApplied = rf.commitIndex
 }
@@ -597,45 +582,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.readPersist(persister.ReadRaftState())
 	rf.readSnapshot(persister.ReadSnapshot())
-	//rf.persist()
 
 	go rf.runServer()
 
 	return rf
-}
-
-func (rf *Raft) RaftStateSize() int {
-	return rf.persister.RaftStateSize()
-}
-
-type SnapShot struct {
-	Data      []byte
-	LogOffset int
-	Term      int
-}
-
-func (rf *Raft) StartSnapshot(snapshot []byte, index int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	baseIndex := rf.logs[0].Index
-	lastIndex := rf.getLastLogIndex()
-	if index <= baseIndex || index > lastIndex {
-		return
-	}
-	var newLogs []Log
-	newLogs = append(newLogs, Log{Term: rf.logs[index-baseIndex].Term, Index: index})
-	for i := index + 1; i <= lastIndex; i++ {
-		newLogs = append(newLogs, rf.logs[i-baseIndex])
-	}
-	rf.logs = newLogs
-	rf.persist()
-
-	w := new(bytes.Buffer)
-	e := gob.NewEncoder(w)
-	e.Encode(newLogs[0].Index)
-	e.Encode(newLogs[0].Term)
-
-	data := w.Bytes()
-	data = append(data, snapshot...)
-	rf.persister.SaveSnapshot(data)
 }
